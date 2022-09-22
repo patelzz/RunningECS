@@ -1,7 +1,7 @@
 # RunningECS
 This is a CloudFormation template that uses ECS Tasks, Step Functions and CloudWatch Events alongside Simple Notification Service to run parallel tasks and send notifications if failures occur. Step Function logic is defined to specifically terminate long-running tasks and to re-try failed tasks before state machine termination.
 
-#Project Context and Purpose 
+# Project Context and Purpose 
 This project appeals to both the Operational Excellence and Performance Efficiency Pillars of the Well-Architected
 framework because automation and continuous monitoring are both achieved. More specifically, automated
 application testing has been accomplished through the use of Docker and ECS Fargate. This design decision allows
@@ -13,7 +13,7 @@ able to handle common failures gracefully and transparently to ensure that many 
 handled without critical business impact. Creating a Step Function State Machine definition including re-try and
 timeout logic on ECS helps us minimize the effects of these faults.
 
-#The Template 
+# The Template 
 This CloudFormation template creates appropriate resources that defines just this. Keeping track of test run results
 and being able to decipher which attempts have failed enables businesses to accurately target and address
 performance inefficiencies. If a request takes too long to load, the logic in our Step Function terminates the request
