@@ -1,0 +1,353 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+
+# Input parameters. Most of these will be automatically provided by AWS::StackName.
+Parameters:
+  ECSClusterArn:
+    Type: String
+    Default: arn:aws:ecs:us-west-2:558035230071:cluster/air-cluster
+    Description: This already exists in air segment accounts
+  ECRImageArn:
+    Type: String
+    Default: alpine:latest
+    Description: Generic docker image
+
+  ParamSubnet1:
+    Type: String
+    Default: subnet-0fd42a9d159469ddd
+    Description: Subnets associated with VPC
+
+  ParamSubnet2:
+    Type: String
+    Default: subnet-0db42d9010a9bdbb4
+    Description: Subnets associated with VPC
+
+  ParamSubnet3:
+    Type: String
+    Default: subnet-03102f9750521d196
+    Description: Subnets associated with VPC
+
+  ParamSG:
+    Type: String
+    Default: sg-081d9e8337e2700fb
+    Description: Security Group associated with VPC
+
+  ClusterArn:
+    Type: String
+    Default: arn:aws:ecs:us-west-2:558035230071:cluster/test-cluster
+    Description: Cluster Arn associated with ECS
+
+  AssignPublicIp:
+    Type: String
+    Default: ENABLED
+    Description: Enable public IP to be assigned
+    AllowedValues:
+      - ENABLED
+      - DISABLED
+
+Resources:
+  # A bucket for test results
+  TestResultBucket:
+    Type: AWS::S3::Bucket
+
+  # A CloudWatch Log Group to catch STDOUT/STDERR from the application for each test run
+  TaskLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${AWS::StackName}
+      RetentionInDays: 14
+
+  # A generic task definition that specifies the Docker image to use and the resources (CPU, RAM) required to run
+  # You might create a task definition for each test type to ensure that each test has the appropriate resources
+  # Because the Docker CMD and ENTRYPOINT can be overriden in a manual or scheduled run, you do not need a task definition
+  # for each permutation of the tests
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ContainerDefinitions:
+        - Name: test-runner
+          Image: !Ref ECRImageArn
+          EntryPoint:
+            - /bin/ash
+            - "-c"
+          Command:
+            - sleep 1
+          # EntryPoint combined with Command means this will be executed: /usr/local/bin/node perf.js 1
+          Environment:
+            - Name: S3_BUCKET
+              Value: !Ref TestResultBucket
+          LogConfiguration:
+              LogDriver: awslogs
+              Options:
+                awslogs-group: !Sub /ecs/${AWS::StackName}
+                awslogs-region: !Ref AWS::Region
+                awslogs-stream-prefix: ecs
+      Cpu: 1024
+      Memory: 8192
+      NetworkMode: awsvpc
+      # This is a semi-automatically-generated role, shared by the AWS account
+      # If you wish to create your own role: https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task_execution_IAM_role.html
+      ExecutionRoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/ecsTaskExecutionRole
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      Tags:
+        - Key: Application
+          Value: !Ref AWS::StackName
+
+  # The permissions given to the task when running
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      RoleName: !Sub ${AWS::StackName}-ecs-task-role
+      Policies:
+        # This grants access to write results to S3 but might also grant read access to Secrets Manager, etc.
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - !Sub
+                    - ${BucketArn}/*
+                    - BucketArn: !GetAtt TestResultBucket.Arn
+
+
+  # Our step function for managing the ECS task execution
+  StepFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - states.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: PassRole
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action: iam:PassRole
+              Resource:
+              - !GetAtt TaskRole.Arn
+              - !Sub arn:aws:iam::${AWS::AccountId}:role/ecsTaskExecutionRole
+        - PolicyName: ExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+              - ecs:RunTask
+              Resource:
+              - !Ref TaskDefinition
+            - Effect: Allow
+              Action:
+              - ecs:StopTask
+              - ecs:DescribeTasks
+              Resource: "*"
+            - Effect: Allow
+              Action:
+              - events:PutTargets
+              - events:PutRule
+              - events:DescribeRule
+              Resource:
+              - !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForECSTaskRule
+          # Assume as step.amazonaws.com
+          # Policy: execute ECS functionality
+          # Managed policy
+  StepFunction:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+       RoleArn: !GetAtt StepFunctionRole.Arn
+       DefinitionString:
+         Fn::Sub: >
+
+           {
+             "Comment": "Attempt at Amazon States Language using Pass states",
+             "StartAt": "Manage ECS task",
+             "States": {
+               "Manage ECS task": {
+                 "Type": "Task",
+                 "InputPath": "$.ecs",
+                 "Resource": "arn:aws:states:::ecs:runTask.sync",
+                 "Parameters": {
+                   "LaunchType": "FARGATE",
+                   "Cluster": "${ClusterArn}",
+                   "TaskDefinition": "${TaskDefinition}",
+                   "NetworkConfiguration": {
+                     "AwsvpcConfiguration": {
+                       "Subnets": ["${ParamSubnet1}", "${ParamSubnet2}", "${ParamSubnet3}"],
+                       "SecurityGroups": ["${ParamSG}"],
+                       "AssignPublicIp": "${AssignPublicIp}"
+                     }
+                   },
+                   "Overrides": {
+                     "ContainerOverrides": [
+                       {
+                         "Name": "test-runner",
+                         "Command.$": "$.Command"
+                       }
+                     ]
+                   }
+                 },
+                 "End": true,
+                 "TimeoutSeconds": 300,
+                 "Retry": [
+                   {
+                     "ErrorEquals": [
+                       "ErrorA",
+                       "ErrorB"
+                     ],
+                     "IntervalSeconds": 1,
+                     "BackoffRate": 2,
+                     "MaxAttempts": 2
+                   },
+                   {
+                     "ErrorEquals": [
+                       "ErrorC"
+                     ],
+                     "IntervalSeconds": 5
+                   }
+                 ]
+
+               }
+               }
+             }
+
+  CloudWatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: ExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+              - states:StartExecution
+              Resource:
+              - !Ref StepFunction
+
+  SnsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: SNS-Topic
+
+# This is the policy needed to be able to publish to your topic created above.
+
+  SnsTopicpolicyRole:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      PolicyDocument:
+        Id: TopicPolicy
+        Version: '2012-10-17'
+        Statement:
+        - Sid: AWSEvents_SendFailurestoSNS_Id615efda1-5a12-4987-b486-dc45b4ce7407
+          Effect: Allow
+          Principal:
+              Service: events.amazonaws.com
+          Action: sns:Publish
+          Resource: !Ref SnsTopic
+      Topics:
+      - !Ref SnsTopic
+
+# Several example schedules
+# To reduce the lines of code in this template, you might use nested stacks to eliminate repeated lines
+# https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/using-cfn-nested-stacks.html
+  PerfSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${AWS::StackName}-perf-run-1
+      ScheduleExpression: rate(5 minutes)
+      State: ENABLED
+      Description: Main perf run
+      Targets:
+      - Arn: !Ref StepFunction
+        Id: perf-1
+        # If the AWS account does not already have an EcsEventsRole,
+        # CloudWatch can automatically create it in the console
+        # Or create a role in this template and assign the managed policy AmazonEC2ContainerServiceEventsRole and refer to it here by ARN
+        RoleArn: !GetAtt CloudWatchRole.Arn
+        # No overrides in this example, so Input is just an empty JSON object
+        Input: |
+                {
+                  "ecs": {
+                    "Command": [
+                      "sleep 1"
+                            ]
+                          }
+                }
+  AccuracySchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${AWS::StackName}-accuracy-run-1
+      ScheduleExpression: rate(5 minutes)
+      State: ENABLED
+      Description: Main accuracy run
+      Targets:
+      - Arn: !Ref StepFunction
+        Id: accuracy-1
+        # If the AWS account does not already have an EcsEventsRole,
+        # CloudWatch can automatically create it in the console
+        # Or create a role in this template and assign the managed policy AmazonEC2ContainerServiceEventsRole and refer to it here by ARN
+        RoleArn: !GetAtt CloudWatchRole.Arn
+        # No overrides in this example, so Input is just an empty JSON object
+        Input: |
+                {
+                  "ecs": {
+                    "Command": [
+                      "sleep 1"
+                            ]
+                          }
+                }
+  SendFailurestoSNS:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${AWS::StackName}-SendFailurestoSNS-run-1
+      EventPattern: {
+        "source": [
+          "aws.states"
+        ],
+        "detail-type": [
+          "Step Functions Execution Status Change"
+        ],
+        "detail": {
+          "status": [
+            "FAILED",
+            "TIMED_OUT"
+          ]
+        }
+      }
+      State: ENABLED
+      Description: Main SendFailurestoSNS run
+      Targets:
+      - Arn: !Ref SnsTopic
+        Id: SendFailurestoSNS-1
+        # If the AWS account does not already have an EcsEventsRole,
+        # CloudWatch can automatically create it in the console
+        # Or create a role in this template and assign the managed policy AmazonEC2ContainerServiceEventsRole and refer to it here by ARN
+        # No overrides in this example, so Input is just an empty JSON object
